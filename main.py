@@ -1,8 +1,16 @@
 import os
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Tuple
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from datetime import datetime, timezone
+
+# Optional Supabase client (installed via requirements)
+try:
+    from supabase import create_client, Client
+except Exception:  # pragma: no cover
+    create_client = None
+    Client = None  # type: ignore
 
 # -----------------------------------------------------------------------------
 # App setup
@@ -53,24 +61,54 @@ class FeatureQuery(BaseModel):
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
 API_DASHBOARD_KEY = os.getenv("API_DASHBOARD_KEY")  # optional admin key for dashboard calls
 
-
-def require_api_key(x_api_key: Optional[str]):
-    """Basic API key guard. In production, verify against Supabase api_keys table or a KMS secret.
-    For now, allow if any non-empty key is provided OR a configured API_DASHBOARD_KEY matches.
-    """
-    if API_DASHBOARD_KEY:
-        if x_api_key == API_DASHBOARD_KEY:
-            return True
-    if not x_api_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-API-Key header")
-    return True
+_supabase_client: Optional[Client] = None
 
 
 def supabase_configured() -> bool:
-    return bool(SUPABASE_URL and (SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY))
+    return bool(SUPABASE_URL and (SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY) and create_client)
+
+
+def get_supabase_client() -> Optional[Client]:
+    global _supabase_client
+    if not supabase_configured():
+        return None
+    if _supabase_client is None:
+        key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY  # prefer service role for server-side ops
+        _supabase_client = create_client(SUPABASE_URL, key)  # type: ignore[arg-type]
+    return _supabase_client
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def verify_api_key(x_api_key: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """Verify API key.
+    Returns (ok, tenant_id_from_key). If API_DASHBOARD_KEY matches, returns (True, None)
+    If Supabase is configured and api_keys table exists, try to map key->tenant_id.
+    """
+    if not x_api_key:
+        return False, None
+    # Admin override
+    if API_DASHBOARD_KEY and x_api_key == API_DASHBOARD_KEY:
+        return True, None
+    # Try Supabase lookup
+    sb = get_supabase_client()
+    if sb is None:
+        # No lookup possible; accept any non-empty key for MVP as previously
+        return True, None
+    try:
+        res = sb.table("api_keys").select("tenant_id, active").eq("api_key", x_api_key).limit(1).execute()
+        if res.data and len(res.data) > 0:
+            row = res.data[0]
+            if row.get("active", True):
+                return True, row.get("tenant_id")
+    except Exception:
+        # If table missing or error, fall back to permissive behavior for MVP
+        return True, None
+    return False, None
 
 
 # -----------------------------------------------------------------------------
@@ -95,38 +133,76 @@ def health():
 
 
 # -----------------------------------------------------------------------------
-# Core endpoints (MVP). These are wired for Supabase but operate in stub mode
-# until environment variables are provided.
+# Core endpoints (MVP)
 # -----------------------------------------------------------------------------
 @app.post("/identify")
 async def identify(payload: IdentifyPayload, request: Request, x_api_key: Optional[str] = Header(default=None)):
-    require_api_key(x_api_key)
+    ok, key_tenant = verify_api_key(x_api_key)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
     if not supabase_configured():
-        # In stub mode, echo back
-        return {"status": "stub", "message": "Supabase not configured", "received": payload.dict()}
+        return {"status": "stub", "message": "Supabase not configured", "received": payload.model_dump()}
 
-    # TODO: Implement Supabase insert into users (and optionally traits JSONB) via REST or client
-    return {"status": "ok", "message": "Identify accepted", "received": payload.dict()}
+    # Enforce tenant match if key maps to tenant
+    if key_tenant and key_tenant != payload.tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant mismatch for API key")
+
+    sb = get_supabase_client()
+    assert sb is not None
+
+    try:
+        data = {
+            "tenant_id": payload.tenant_id,
+            "user_id": payload.user_id,
+            "traits": payload.traits or {},
+            "updated_at": now_iso(),
+        }
+        # Upsert on (tenant_id, user_id)
+        res = sb.table("users").upsert(data, on_conflict="tenant_id,user_id").execute()
+        return {"status": "ok", "result": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Supabase error (identify): {e}")
 
 
 @app.post("/events")
 async def events(payload: EventPayload, request: Request, x_api_key: Optional[str] = Header(default=None)):
-    require_api_key(x_api_key)
+    ok, key_tenant = verify_api_key(x_api_key)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
     if not supabase_configured():
-        return {"status": "stub", "message": "Supabase not configured", "received": payload.dict()}
+        return {"status": "stub", "message": "Supabase not configured", "received": payload.model_dump()}
 
-    # TODO: Insert into user_activities (event stream)
-    return {"status": "ok", "message": "Event accepted", "received": payload.dict()}
+    if key_tenant and key_tenant != payload.tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant mismatch for API key")
+
+    sb = get_supabase_client()
+    assert sb is not None
+
+    try:
+        data = {
+            "tenant_id": payload.tenant_id,
+            "user_id": payload.user_id,
+            "anonymous_id": payload.anonymous_id,
+            "event": payload.event,
+            "properties": payload.properties or {},
+            "timestamp": payload.timestamp or now_iso(),
+            "ingested_at": now_iso(),
+        }
+        res = sb.table("user_activities").insert(data).execute()
+        return {"status": "ok", "result": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Supabase error (events): {e}")
 
 
 @app.get("/features")
 async def features(tenant_id: str, item_ids: Optional[str] = None, limit: int = 50, x_api_key: Optional[str] = Header(default=None)):
-    require_api_key(x_api_key)
+    ok, key_tenant = verify_api_key(x_api_key)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
     if not supabase_configured():
-        # Return placeholder features
         items = item_ids.split(",") if item_ids else ["demo-item-1", "demo-item-2"]
         return {
             "status": "stub",
@@ -134,16 +210,33 @@ async def features(tenant_id: str, item_ids: Optional[str] = None, limit: int = 
             "items": [{"item_id": i, "features": {"category": "demo", "score": 0.5}} for i in items][:limit]
         }
 
-    # TODO: Query features table filtered by tenant_id and item_ids
-    return {"status": "ok", "items": []}
+    if key_tenant and key_tenant != tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant mismatch for API key")
+
+    sb = get_supabase_client()
+    assert sb is not None
+
+    try:
+        query = sb.table("features").select("item_id, features").eq("tenant_id", tenant_id).limit(limit)
+        if item_ids:
+            ids_list = [i.strip() for i in item_ids.split(",") if i.strip()]
+            if ids_list:
+                query = query.in_("item_id", ids_list)
+        res = query.execute()
+        # Normalize output
+        items = [{"item_id": row.get("item_id"), "features": row.get("features", {})} for row in (res.data or [])]
+        return {"status": "ok", "items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Supabase error (features): {e}")
 
 
 @app.post("/recommendations")
 async def recommendations(payload: RecommendationRequest, x_api_key: Optional[str] = Header(default=None)):
-    require_api_key(x_api_key)
+    ok, key_tenant = verify_api_key(x_api_key)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
     if not supabase_configured():
-        # Simple fallback: popular + recent demo
         demo = [
             {"item_id": f"demo-{i}", "score": 1.0 - i * 0.05, "reason": payload.strategy}
             for i in range(max(1, min(payload.count, 20)))
@@ -153,8 +246,47 @@ async def recommendations(payload: RecommendationRequest, x_api_key: Optional[st
                 d["features"] = {"category": "demo", "popularity": 0.8}
         return {"status": "stub", "message": "Supabase not configured", "items": demo}
 
-    # TODO: Fetch recent/popular/personalized using Supabase (SQL or materialized views)
-    return {"status": "ok", "items": []}
+    if key_tenant and key_tenant != payload.tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant mismatch for API key")
+
+    sb = get_supabase_client()
+    assert sb is not None
+
+    try:
+        # Simple MVP strategies
+        if payload.strategy == "recent":
+            # Join user_activities -> items by item_id if exists; fallback to selecting latest items
+            res = sb.rpc("get_recent_items", {"p_tenant_id": payload.tenant_id, "p_limit": payload.count}).execute()
+            rows = res.data or []
+        elif payload.strategy == "popular":
+            res = sb.rpc("get_popular_items", {"p_tenant_id": payload.tenant_id, "p_limit": payload.count}).execute()
+            rows = res.data or []
+        else:
+            # personalized baseline: fallback to popular for now
+            res = sb.rpc("get_popular_items", {"p_tenant_id": payload.tenant_id, "p_limit": payload.count}).execute()
+            rows = res.data or []
+
+        items = []
+        for r in rows:
+            item = {"item_id": r.get("item_id"), "score": r.get("score", 0.0)}
+            if payload.include_features:
+                item["features"] = r.get("features")
+            items.append(item)
+        return {"status": "ok", "items": items}
+    except Exception as e:
+        # If RPCs not present, do a simple table-based fallback
+        try:
+            q = sb.table("items").select("item_id, features, popularity").eq("tenant_id", payload.tenant_id).order("popularity", desc=True).limit(payload.count)
+            res = q.execute()
+            items = []
+            for r in (res.data or []):
+                item = {"item_id": r.get("item_id"), "score": r.get("popularity", 0.0)}
+                if payload.include_features:
+                    item["features"] = r.get("features")
+                items.append(item)
+            return {"status": "ok", "items": items, "note": "fallback without RPC", "error": str(e)}
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Supabase error (recommendations): {e2}")
 
 
 # -----------------------------------------------------------------------------
@@ -173,8 +305,9 @@ async def test_info():
             "url": "✅ Set" if SUPABASE_URL else "❌ Not Set",
             "anon_key": "✅ Set" if SUPABASE_ANON_KEY else "❌ Not Set",
             "service_role_key": "✅ Set" if SUPABASE_SERVICE_ROLE_KEY else "❌ Not Set",
+            "client_loaded": bool(create_client) and bool(get_supabase_client())
         },
-        "note": "Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to enable persistence."
+        "note": "Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to enable full persistence."
     }
 
 
